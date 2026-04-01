@@ -1,8 +1,12 @@
 # Auth Patterns
 
-Reference for outbound authentication — credentials your MCP server uses when
-calling an upstream REST API. This is distinct from inbound OAuth validation
-(see `oauth-middleware.md`).
+Reference for authentication in MCP servers — both directions:
+
+- **Methods 1–7:** Outbound auth — credentials your MCP server uses when
+  calling an upstream REST API.
+- **Method 8:** Inbound auth — validating Bearer tokens presented by MCP
+  clients (Claude, agents) before any tool executes. Full implementation in
+  `references/oauth-middleware.md`.
 
 ---
 
@@ -339,6 +343,84 @@ def get_client(settings: Settings) -> httpx.AsyncClient:
         timeout=30.0,
     )
 ```
+
+---
+
+## Method 8: Inbound Token Validation (FastMCP Middleware)
+
+**When to use:** Your MCP server is deployed with **streamable-HTTP transport**
+and must verify that the caller (Claude, an agent, or any MCP client) presents
+a valid Bearer token before any tool executes.
+
+**stdio transport:** Skip this entirely. stdio is a local process — the caller
+is the authenticated local user running Claude Code.
+
+**Why middleware and not tool-level checks:**
+- Single enforcement point — new tools are protected automatically
+- Returns 401/403 before tool deserialization — no wasted compute
+- Keeps auth logic out of business logic
+
+```
+MCP Client (Claude / agent)
+    │  Authorization: Bearer <client_token>
+    ▼
+[OAuthMiddleware]   ← validates WHO IS CALLING your MCP server  (inbound)
+    ▼
+[Tool Handler]
+    │
+    ▼
+[TokenManager]      ← generates tokens for calling the UPSTREAM API  (outbound)
+    │  Authorization: Bearer <server_token>
+    ▼
+Upstream REST API
+```
+
+**Two validation modes** (choose one, configure via `OAUTH_VALIDATION_MODE`):
+
+| Mode | Token type | Network cost | When to use |
+|------|-----------|-------------|-------------|
+| `jwks` | JWT (signed) | Zero after first call (keys cached 1 h) | Auth0, Okta, Azure AD, Keycloak, Google |
+| `introspect` | Opaque or JWT | One round-trip per call | Tokens that are not JWTs, or when local validation is not possible |
+
+**Required env vars:**
+
+```bash
+DISABLE_AUTH=false                  # true only for local dev without an IdP
+OAUTH_VALIDATION_MODE=jwks          # or: introspect
+
+# JWKS mode
+JWKS_URI=https://your-idp/.well-known/jwks.json
+OAUTH_AUDIENCE=https://api.your-service.com
+OAUTH_ISSUER=https://your-idp/
+
+# Introspect mode (instead of JWKS vars above)
+INTROSPECTION_ENDPOINT=https://your-idp/oauth/introspect
+
+# Shared — leave empty to skip global scope check
+# Use @require_scope on individual tools for per-tool scope enforcement
+REQUIRED_SCOPE=
+```
+
+**Per-tool scope enforcement** (when different tools need different scopes):
+
+```python
+from src.middleware import require_scope
+
+@mcp.tool(name="list_users", annotations={"readOnlyHint": True})
+@log_tool_call
+@require_scope("read:users")          # ← enforces scope before tool runs
+async def list_users(params: ListUsersInput, ctx: Context) -> str:
+    ...
+
+@mcp.tool(name="delete_user", annotations={"destructiveHint": True})
+@log_tool_call
+@require_scope("admin:users")         # ← stricter scope for destructive tools
+async def delete_user(params: DeleteUserInput, ctx: Context) -> str:
+    ...
+```
+
+See `references/oauth-middleware.md` for the full `OAuthMiddleware`,
+`NoOpMiddleware`, and `require_scope` implementations.
 
 ---
 

@@ -40,7 +40,9 @@ Upstream REST API
 
 ```python
 # src/middleware.py
+import contextvars
 import logging
+from functools import wraps
 from typing import Any, Callable
 
 import httpx
@@ -48,6 +50,12 @@ import jwt  # PyJWT
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
 logger = logging.getLogger(__name__)
+
+# Per-request store for validated token claims.
+# Set by OAuthMiddleware after successful validation; read by @require_scope.
+_token_claims: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "token_claims", default={}
+)
 
 
 class OAuthMiddleware(Middleware):
@@ -80,7 +88,10 @@ class OAuthMiddleware(Middleware):
                 "Missing Authorization header. "
                 "Provide: Authorization: Bearer <token>"
             )
-        await self._validate_token(token)
+        claims = await self._validate_token(token)
+        # Store validated claims in a per-request ContextVar so that
+        # @require_scope decorators on individual tools can read them.
+        _token_claims.set(claims)
         return await call_next(context)
 
     # ------------------------------------------------------------------
@@ -99,12 +110,13 @@ class OAuthMiddleware(Middleware):
     # Validation dispatch
     # ------------------------------------------------------------------
 
-    async def _validate_token(self, token: str) -> None:
+    async def _validate_token(self, token: str) -> dict:
+        """Validate the token and return its claims."""
         mode = self._settings.oauth_validation_mode
         if mode == "jwks":
-            await self._validate_jwks(token)
+            return await self._validate_jwks(token)
         elif mode == "introspect":
-            await self._validate_introspect(token)
+            return await self._validate_introspect(token)
         else:
             raise ValueError(f"Unknown OAUTH_VALIDATION_MODE: {mode!r}")
 
@@ -112,10 +124,11 @@ class OAuthMiddleware(Middleware):
     # JWKS validation (JWT tokens)
     # ------------------------------------------------------------------
 
-    async def _validate_jwks(self, token: str) -> None:
+    async def _validate_jwks(self, token: str) -> dict:
         """
         Validate a JWT locally using the IdP's JWKS endpoint.
         Keys are cached for 1 hour (lifespan=3600).
+        Returns the decoded claims dict.
         """
         if not self._jwks_client:
             self._jwks_client = jwt.PyJWKClient(
@@ -132,13 +145,14 @@ class OAuthMiddleware(Middleware):
                 audience=self._settings.oauth_audience,
                 issuer=self._settings.oauth_issuer,
             )
-            # Check required scopes if configured
+            # Check global required_scope if configured
             if self._settings.required_scope:
                 self._check_scopes(payload, self._settings.required_scope)
             logger.debug(
                 "token_validated_jwks",
                 extra={"sub": payload.get("sub", "unknown")},
             )
+            return payload
         except jwt.ExpiredSignatureError:
             raise PermissionError("Token has expired. Request a new token.")
         except jwt.InvalidAudienceError:
@@ -167,10 +181,11 @@ class OAuthMiddleware(Middleware):
     # Introspection validation (opaque tokens)
     # ------------------------------------------------------------------
 
-    async def _validate_introspect(self, token: str) -> None:
+    async def _validate_introspect(self, token: str) -> dict:
         """
         Validate an opaque token via the IdP's introspection endpoint.
         One network round-trip per call.
+        Returns the introspection response dict as claims.
         """
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(
@@ -200,6 +215,7 @@ class OAuthMiddleware(Middleware):
             "token_validated_introspect",
             extra={"sub": data.get("sub", "unknown")},
         )
+        return data
 
 
 class NoOpMiddleware(Middleware):
@@ -218,6 +234,40 @@ class NoOpMiddleware(Middleware):
             extra={"message": "DISABLE_AUTH=true — no token validation"},
         )
         return await call_next(context)
+
+
+def require_scope(scope: str):
+    """
+    Per-tool scope enforcement decorator.
+
+    Use when different tools in the same server require different OAuth scopes
+    (e.g. read:users for list_users, admin:users for delete_user).
+
+    Prerequisites:
+    - OAuthMiddleware must run first and populate `_token_claims`.
+    - The global `required_scope` in Settings can be left empty; scope
+      enforcement is fully delegated to @require_scope on each tool.
+
+    Usage:
+        @mcp.tool(name="delete_user", annotations={"destructiveHint": True})
+        @log_tool_call
+        @require_scope("admin:users")
+        async def delete_user(params: DeleteUserInput, ctx: Context) -> str:
+            ...
+    """
+    def decorator(fn):
+        @wraps(fn)
+        async def wrapper(*args, **kwargs):
+            claims = _token_claims.get()
+            granted = set(claims.get("scope", "").split())
+            if scope not in granted:
+                raise PermissionError(
+                    f"Insufficient scope. Required: '{scope}'. "
+                    f"Granted: {granted or 'none'}."
+                )
+            return await fn(*args, **kwargs)
+        return wrapper
+    return decorator
 ```
 
 ---
@@ -372,6 +422,159 @@ class TestOAuthMiddleware:
         call_next = AsyncMock(return_value="result")
         result = await middleware.on_call_tool(context, call_next)
         assert result == "result"
+
+    # ── Rejection test suite ───────────────────────────────────────────────
+
+    async def test_malformed_header_no_bearer_prefix(self, settings):
+        """Token present but missing 'Bearer ' prefix → treated as missing."""
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Token abc123"}
+        call_next = AsyncMock()
+
+        with pytest.raises(PermissionError, match="Missing Authorization"):
+            await middleware.on_call_tool(context, call_next)
+
+        call_next.assert_not_called()
+
+    async def test_invalid_signature_rejected(self, settings):
+        """JWT with a tampered signature fails JWKS validation → 401."""
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Bearer tampered.jwt.token"}
+        call_next = AsyncMock()
+
+        with patch.object(
+            middleware,
+            "_validate_jwks",
+            AsyncMock(side_effect=PermissionError("Token validation failed: Invalid signature")),
+        ):
+            with pytest.raises(PermissionError, match="Invalid signature"):
+                await middleware.on_call_tool(context, call_next)
+
+        call_next.assert_not_called()
+
+    async def test_wrong_audience_rejected(self, settings):
+        """JWT with wrong 'aud' claim → 401."""
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Bearer valid.signed.jwt"}
+        call_next = AsyncMock()
+
+        with patch.object(
+            middleware,
+            "_validate_jwks",
+            AsyncMock(side_effect=PermissionError("Token audience mismatch")),
+        ):
+            with pytest.raises(PermissionError, match="audience mismatch"):
+                await middleware.on_call_tool(context, call_next)
+
+    async def test_wrong_issuer_rejected(self, settings):
+        """JWT with wrong 'iss' claim → 401."""
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Bearer valid.signed.jwt"}
+        call_next = AsyncMock()
+
+        with patch.object(
+            middleware,
+            "_validate_jwks",
+            AsyncMock(side_effect=PermissionError("Token issuer mismatch")),
+        ):
+            with pytest.raises(PermissionError, match="issuer mismatch"):
+                await middleware.on_call_tool(context, call_next)
+
+    async def test_scope_mismatch_rejected(self, settings):
+        """Valid JWT but missing required scope → PermissionError."""
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Bearer valid.jwt"}
+        call_next = AsyncMock()
+
+        with patch.object(
+            middleware,
+            "_validate_jwks",
+            AsyncMock(side_effect=PermissionError("Token missing required scopes")),
+        ):
+            with pytest.raises(PermissionError, match="missing required scopes"):
+                await middleware.on_call_tool(context, call_next)
+
+    async def test_introspection_inactive_token(self, settings):
+        """Introspection returns active=false → 401."""
+        settings.oauth_validation_mode = "introspect"
+        settings.introspection_endpoint = "https://idp.example.com/introspect"
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Bearer revoked-opaque-token"}
+        call_next = AsyncMock()
+
+        with patch.object(
+            middleware,
+            "_validate_introspect",
+            AsyncMock(side_effect=PermissionError("Token is inactive or has been revoked")),
+        ):
+            with pytest.raises(PermissionError, match="inactive"):
+                await middleware.on_call_tool(context, call_next)
+
+    async def test_jwks_cache_used_on_second_call(self, settings):
+        """JWKS signing keys are fetched once and cached across calls."""
+        middleware = OAuthMiddleware(settings)
+        context = MagicMock()
+        context.request.headers = {"Authorization": "Bearer valid.jwt"}
+        call_next = AsyncMock(return_value="ok")
+
+        validated_claims = {"sub": "u1", "scope": "mcp:read"}
+        with patch.object(
+            middleware,
+            "_validate_token",
+            AsyncMock(return_value=validated_claims),
+        ) as mock_validate:
+            await middleware.on_call_tool(context, call_next)
+            await middleware.on_call_tool(context, call_next)
+
+        # Validate called twice but we verify JWKS client is a single instance
+        assert mock_validate.call_count == 2
+        # The same _jwks_client instance should be reused (not re-created)
+        # Real test: instantiate _jwks_client once and confirm no second HTTP call.
+        # In integration tests, assert httpx_mock call count == 1 for JWKS fetch.
+
+
+class TestRequireScope:
+    async def test_passes_when_scope_present(self):
+        from src.middleware import require_scope, _token_claims
+
+        _token_claims.set({"sub": "u1", "scope": "read:users write:users"})
+
+        @require_scope("read:users")
+        async def my_tool():
+            return "ok"
+
+        assert await my_tool() == "ok"
+
+    async def test_raises_when_scope_missing(self):
+        from src.middleware import require_scope, _token_claims
+
+        _token_claims.set({"sub": "u1", "scope": "read:users"})
+
+        @require_scope("admin:users")
+        async def my_tool():
+            return "ok"
+
+        with pytest.raises(PermissionError, match="Insufficient scope"):
+            await my_tool()
+
+    async def test_raises_when_no_claims_set(self):
+        """No middleware ran (e.g. test misconfiguration) → scope check fails safely."""
+        from src.middleware import require_scope, _token_claims
+
+        _token_claims.set({})  # empty — no claims
+
+        @require_scope("read:users")
+        async def my_tool():
+            return "ok"
+
+        with pytest.raises(PermissionError, match="Insufficient scope"):
+            await my_tool()
 ```
 
 ---

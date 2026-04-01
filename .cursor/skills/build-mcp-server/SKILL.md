@@ -84,8 +84,14 @@ Ask together:
   (b) Docker (single container)
   (c) Kubernetes — with GitLab CI/CD pipeline (test → build → staging → production)
   (d) other cloud target (specify)
-- Does this server need to **validate OAuth tokens from callers** (i.e., Claude
-  or agents calling your server must present a Bearer token)? (yes/no)
+- **Inbound token validation** — does this server need to verify Bearer tokens
+  from callers (Claude, agents, MCP clients)?
+  - **HTTP transport → strongly recommended.** Any network client can reach
+    your server; inbound validation is the primary security boundary.
+  - **stdio transport → N/A.** Skip this; stdio is a local process and the
+    caller is the authenticated local user.
+  If yes: which mode? **(a) JWKS** (JWT tokens, no network hop per call —
+  recommended) or **(b) Introspect** (opaque tokens, one network call per call).
 
 ### Mode 2: REST API Conversion
 
@@ -125,7 +131,11 @@ If OAuth 2.0 client credentials selected, also ask:
   - Does the token expire and need refresh? (yes/no — most do)
 
 Also ask:
-- Does this server need to **validate OAuth tokens from callers**? (yes/no)
+- **Inbound token validation** — does this server need to verify Bearer tokens
+  from callers?
+  - **HTTP transport → strongly recommended.**
+  - **stdio transport → N/A.**
+  If yes: **(a) JWKS** or **(b) Introspect**?
 
 **Batch C — Deployment**
 
@@ -136,7 +146,8 @@ Ask together:
   (b) Docker (single container)
   (c) Kubernetes — with GitLab CI/CD pipeline (test → build → staging → production)
   (d) other cloud target (specify)
-- Does this server need to **validate OAuth tokens from callers**? (yes/no)
+- If HTTP transport: inbound token validation is strongly recommended. Confirm
+  validation mode: **(a) JWKS** (recommended) or **(b) Introspect**?
 
 **Batch D — Prioritization**
 
@@ -314,7 +325,7 @@ Load the following reference files now:
 - `references/scaffold-fastmcp.md` (always)
 - `references/auth-patterns.md` (always)
 - `references/tool-logging.md` (always)
-- `references/oauth-middleware.md` (if user said yes to inbound OAuth validation)
+- `references/oauth-middleware.md` (if HTTP transport — inbound validation is strongly recommended; always load for HTTP)
 - `references/deployment-k8s-gitlab.md` (if deployment target is Docker, Kubernetes, or cloud)
 
 Generate files in this exact order:
@@ -439,6 +450,6 @@ Upstream REST API
 | `references/auth-patterns.md` | Phase 4 always |
 | `references/tdd-patterns.md` | Phase 3 |
 | `references/tool-logging.md` | Phase 4 always |
-| `references/oauth-middleware.md` | Phase 4 if inbound OAuth requested |
+| `references/oauth-middleware.md` | Phase 4 — always for HTTP transport (strongly recommended) |
 | `references/resources-and-prompts.md` | Phase 2b if any Resources or Prompts identified |
 | `references/deployment-k8s-gitlab.md` | Phase 4 if deployment target is Docker, Kubernetes, or cloud |
