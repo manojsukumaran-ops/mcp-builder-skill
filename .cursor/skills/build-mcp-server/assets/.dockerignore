@@ -1,0 +1,21 @@
+# Secrets — must never be in the image
+.env
+.env.*
+
+# Test artifacts
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+__pycache__/
+*.py[cod]
+
+# Dev tooling
+.venv/
+venv/
+.git/
+.gitignore
+*.md
+k8s/
+.gitlab-ci.yml
+docker-compose.yml

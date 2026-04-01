@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {service}-mcp
+  namespace: {namespace}
+  labels:
+    app: {service}-mcp
+spec:
+  selector:
+    app: {service}-mcp
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8000
+  type: ClusterIP

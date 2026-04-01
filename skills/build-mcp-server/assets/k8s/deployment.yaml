@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {service}-mcp
+  namespace: {namespace}
+  labels:
+    app: {service}-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: {service}-mcp
+  template:
+    metadata:
+      labels:
+        app: {service}-mcp
+    spec:
+      # Pod-level security: run as non-root
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: mcp-server
+          image: IMAGE_PLACEHOLDER        # replaced by CI pipeline sed command
+          imagePullPolicy: Always
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          # Non-secret config from ConfigMap
+          envFrom:
+            - configMapRef:
+                name: {service}-mcp-config
+
+          # Secrets injected individually (never via envFrom on a Secret — too broad)
+          env:
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {service}-mcp-secrets
+                  key: OAUTH_CLIENT_ID
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {service}-mcp-secrets
+                  key: OAUTH_CLIENT_SECRET
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          # TCP socket probes — safe default; upgrade to httpGet once /health exists
+          readinessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+
+          livenessProbe:
+            tcpSocket:
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+
+          # Container-level hardening
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true   # test with `docker run --read-only` first
+            capabilities:
+              drop:
+                - ALL
+
+          # Required when readOnlyRootFilesystem=true
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: pyc-cache
+              mountPath: /app/__pycache__
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: pyc-cache
+          emptyDir: {}
+
+      restartPolicy: Always

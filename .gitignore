@@ -1,0 +1,44 @@
+# Environment — never commit secrets
+.env
+.env.local
+.env.*.local
+.env.secrets
+
+# Kubernetes secrets — never commit real values
+k8s/*-secret.yaml
+k8s/secret.yaml
+k8s/secrets.yaml
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local Claude Code settings (machine-specific permissions)
+.claude/settings.local.json
+
+# Logs
+*.log
+logs/

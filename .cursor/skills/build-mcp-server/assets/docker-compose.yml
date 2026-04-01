@@ -1,0 +1,14 @@
+services:
+  mcp-server:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      # Mount source for hot-reload during development.
+      # Remove this volume for production-like local testing.
+      - ./src:/app/src:ro
+    environment:
+      LOG_LEVEL: DEBUG
+      DISABLE_AUTH: "true"   # bypasses OAuthMiddleware — no IdP needed locally
+    restart: unless-stopped
